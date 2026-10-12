@@ -93,6 +93,8 @@ export interface CapturedImage {
 	dataUrl: string;
 	/** If true, AI should detect multiple items in this image */
 	separateItems: boolean;
+	/** If true (with separateItems), AI merges related items into "Collection of..." groups */
+	groupSimilar?: boolean;
 	/** Optional instructions for AI about this image */
 	extraInstructions: string;
 	/** Additional images showing the same item from different angles */
@@ -274,6 +276,8 @@ export interface DetectedItem extends ItemCore, ItemExtended {
 	custom_fields?: Record<string, string> | null;
 	/** Duplicate match info if serial matches an existing item */
 	duplicate_match?: DuplicateMatch | null;
+	/** Per-item cropped/compressed image (multi-item mode) */
+	compressed_image?: CompressedImage | null;
 }
 
 /** Details of an existing item that matches a detected item's serial number */

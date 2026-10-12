@@ -9,6 +9,7 @@ from loguru import logger
 from ...ai.images import encode_image_bytes_to_data_uri
 from ...ai.llm import vision_completion
 from ...ai.response_models import get_items_response_model
+from ...core.config import settings as config
 from .models import DetectedItem, get_items_adapter
 from .prompts import (
     build_detection_system_prompt,
@@ -31,6 +32,7 @@ async def detect_items_from_bytes(
     field_preferences: dict[str, str] | None = None,
     output_language: str | None = None,
     custom_fields: list[CustomFieldDefinition] | None = None,
+    group_similar: bool = False,
 ) -> list[DetectedItem]:
     """Use LLM vision model to detect items from raw image bytes.
 
@@ -46,17 +48,35 @@ async def detect_items_from_bytes(
         field_preferences: Optional dict of field customization instructions.
         output_language: Target language for AI output (default: English).
         custom_fields: Optional list of custom field definitions.
+        group_similar: If True (multi-item mode), merge related items into
+            grouped "Collection of..." entries.
 
     Returns:
         List of detected items with quantities, descriptions, and optionally
-        extended fields when extract_extended_fields is True.
+        extended fields when extract_extended_fields is True. In multi-item
+        mode, each item carries source_image_index/bbox for per-item cropping.
     """
-    # Build list of all image data URIs
-    image_data_uris = [encode_image_bytes_to_data_uri(image_bytes, mime_type)]
+    # Build list of all image data URIs (sized for the vision model —
+    # smaller images mean faster uploads and fewer prompt tokens)
+    image_data_uris = [
+        encode_image_bytes_to_data_uri(
+            image_bytes,
+            mime_type,
+            max_dimension=config.vision_max_dimension,
+            quality=config.vision_quality,
+        )
+    ]
 
     if additional_images:
         for add_bytes, add_mime in additional_images:
-            image_data_uris.append(encode_image_bytes_to_data_uri(add_bytes, add_mime))
+            image_data_uris.append(
+                encode_image_bytes_to_data_uri(
+                    add_bytes,
+                    add_mime,
+                    max_dimension=config.vision_max_dimension,
+                    quality=config.vision_quality,
+                )
+            )
 
     return await _detect_items_from_data_uris(
         image_data_uris,
@@ -67,6 +87,7 @@ async def detect_items_from_bytes(
         field_preferences=field_preferences,
         output_language=output_language,
         custom_fields=custom_fields,
+        group_similar=group_similar,
     )
 
 
@@ -79,6 +100,7 @@ async def _detect_items_from_data_uris(
     field_preferences: dict[str, str] | None = None,
     output_language: str | None = None,
     custom_fields: list[CustomFieldDefinition] | None = None,
+    group_similar: bool = False,
 ) -> list[DetectedItem]:
     """Core detection logic supporting multiple images.
 
@@ -91,6 +113,8 @@ async def _detect_items_from_data_uris(
         field_preferences: Optional dict of field customization instructions.
         output_language: Target language for AI output (default: English).
         custom_fields: Optional list of custom field definitions.
+        group_similar: If True (multi-item mode), merge related items into
+            grouped "Collection of..." entries.
     """
     if not image_data_uris:
         return []
@@ -104,6 +128,7 @@ async def _detect_items_from_data_uris(
     logger.debug(f"Field preferences: {len(field_preferences) if field_preferences else 0}")
     logger.debug(f"Output language: {output_language or 'English (default)'}")
     logger.debug(f"Custom fields: {len(custom_fields) if custom_fields else 0}")
+    logger.debug(f"Group similar: {group_similar}")
 
     # Build prompts
     if multi_image:
@@ -114,6 +139,8 @@ async def _detect_items_from_data_uris(
             field_preferences,
             output_language,
             custom_fields=custom_fields,
+            group_similar=group_similar,
+            image_count=len(image_data_uris),
         )
     else:
         system_prompt = build_detection_system_prompt(
@@ -123,6 +150,8 @@ async def _detect_items_from_data_uris(
             field_preferences,
             output_language,
             custom_fields=custom_fields,
+            group_similar=group_similar,
+            image_count=len(image_data_uris),
         )
 
     user_prompt = build_detection_user_prompt(extra_instructions, extract_extended_fields, multi_image, single_item)
@@ -144,6 +173,8 @@ async def _detect_items_from_data_uris(
     logger.info(f"Detected {len(items)} items from {len(image_data_uris)} image(s)")
     for item in items:
         logger.debug(f"  Item: {item.name}, qty: {item.quantity}, tags: {item.tag_ids}")
+        if not single_item:
+            logger.debug(f"    Location: image {item.source_image_index}, bbox {item.bbox}")
         if extract_extended_fields and item.has_extended_fields():
             logger.debug(
                 f"    Extended: manufacturer={item.manufacturer}, "

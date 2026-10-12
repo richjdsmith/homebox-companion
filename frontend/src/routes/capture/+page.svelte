@@ -13,6 +13,7 @@
 	import { getInitPromise } from '$lib/services/tokenRefresh';
 	import { createLogger } from '$lib/utils/logger';
 	import { getConfig } from '$lib/api/settings';
+	import { compressImageForUpload } from '$lib/utils/imageCompress';
 	import Button from '$lib/components/Button.svelte';
 	import AppContainer from '$lib/components/AppContainer.svelte';
 	import StepIndicator from '$lib/components/StepIndicator.svelte';
@@ -198,66 +199,78 @@
 
 		// Track count locally for limit enforcement
 		let currentCount = totalImageCount;
-
-		for (const file of Array.from(input.files)) {
-			if (currentCount >= maxImages) {
-				showToast(`Maximum ${maxImages} images allowed`, 'warning');
-				break;
-			}
-
-			if (isFileTooLarge(file)) continue;
-
-			currentCount++;
-
-			// Use Object URL instead of base64 data URL - much more memory efficient
-			// Object URLs are tiny strings that reference the File blob in memory
-			// instead of duplicating the entire file as a base64 string
-			const previewUrl = createTrackedObjectUrl(file);
-
-			workflow.addImage({
-				file,
-				dataUrl: previewUrl,
-				separateItems: false,
-				extraInstructions: '',
-			});
-			// Collapse all expanded accordions when a new image is added
-			expandedImages.clear();
-		}
-
+		const selected = Array.from(input.files);
+		// Reset the input immediately so picking the same file(s) again re-fires change
 		input.value = '';
+
+		void (async () => {
+			for (const file of selected) {
+				if (currentCount >= maxImages) {
+					showToast(`Maximum ${maxImages} images allowed`, 'warning');
+					break;
+				}
+
+				const compressed = await compressImageForUpload(file);
+				if (isFileTooLarge(compressed)) continue;
+
+				currentCount++;
+
+				log.debug(
+					`Compressed for upload: ${file.name} ${formatFileSize(file.size)} -> ${formatFileSize(compressed.size)}`
+				);
+
+				// Use Object URL instead of base64 data URL - much more memory efficient
+				// Object URLs are tiny strings that reference the File blob in memory
+				// instead of duplicating the entire file as a base64 string
+				const previewUrl = createTrackedObjectUrl(compressed);
+
+				workflow.addImage({
+					file: compressed,
+					dataUrl: previewUrl,
+					separateItems: false,
+					extraInstructions: '',
+				});
+				// Collapse all expanded accordions when a new image is added
+				expandedImages.clear();
+			}
+		})();
 	}
 
 	function handleAdditionalImageSelect(imageIndex: number, e: Event) {
 		const input = e.target as HTMLInputElement;
 		if (!input.files) return;
 
-		const newFiles: File[] = [];
-		const newPreviewUrls: string[] = [];
-
 		// Track how many more we can accept
-		const remainingSlots = maxImages - totalImageCount;
+		const remainingSlots = Math.max(0, maxImages - totalImageCount);
+		const selected = Array.from(input.files);
+		if (selected.length > remainingSlots) {
+			showToast(`Maximum ${maxImages} images allowed`, 'warning');
+		}
+		input.value = '';
 
-		for (const file of Array.from(input.files)) {
-			// Check total image limit (including additional images)
-			if (newFiles.length >= remainingSlots) {
-				showToast(`Maximum ${maxImages} images allowed`, 'warning');
-				break;
+		void (async () => {
+			const newFiles: File[] = [];
+			const newPreviewUrls: string[] = [];
+
+			for (const file of selected.slice(0, remainingSlots)) {
+				const compressed = await compressImageForUpload(file);
+				if (isFileTooLarge(compressed)) continue;
+
+				log.debug(
+					`Compressed for upload: ${file.name} ${formatFileSize(file.size)} -> ${formatFileSize(compressed.size)}`
+				);
+
+				// Use Object URL instead of base64 - much more memory efficient
+				const previewUrl = createTrackedObjectUrl(compressed);
+				newFiles.push(compressed);
+				newPreviewUrls.push(previewUrl);
 			}
 
-			if (isFileTooLarge(file)) continue;
-
-			// Use Object URL instead of base64 - much more memory efficient
-			const previewUrl = createTrackedObjectUrl(file);
-			newFiles.push(file);
-			newPreviewUrls.push(previewUrl);
-		}
-
-		// Add all valid files at once (synchronous, no FileReader needed)
-		if (newFiles.length > 0) {
-			workflow.addAdditionalImages(imageIndex, newFiles, newPreviewUrls);
-		}
-
-		input.value = '';
+			// Add all valid files at once (synchronous, no FileReader needed)
+			if (newFiles.length > 0) {
+				workflow.addAdditionalImages(imageIndex, newFiles, newPreviewUrls);
+			}
+		})();
 	}
 
 	/** Handle paste event on the description input to add images from clipboard */
@@ -282,25 +295,31 @@
 
 		const newFiles: File[] = [];
 		const newPreviewUrls: string[] = [];
-		const remainingSlots = maxImages - totalImageCount;
+		const remainingSlots = Math.max(0, maxImages - totalImageCount);
+		const filesToProcess = imageFiles.slice(0, remainingSlots);
+		if (imageFiles.length > remainingSlots) {
+			showToast(`Maximum ${maxImages} images allowed`, 'warning');
+		}
 
-		for (const file of imageFiles) {
-			if (newFiles.length >= remainingSlots) {
-				showToast(`Maximum ${maxImages} images allowed`, 'warning');
-				break;
+		void (async () => {
+			for (const file of filesToProcess) {
+				const compressed = await compressImageForUpload(file);
+				if (isFileTooLarge(compressed)) continue;
+
+				log.debug(
+					`Compressed for upload: ${file.name} ${formatFileSize(file.size)} -> ${formatFileSize(compressed.size)}`
+				);
+
+				const previewUrl = createTrackedObjectUrl(compressed);
+				newFiles.push(compressed);
+				newPreviewUrls.push(previewUrl);
 			}
 
-			if (isFileTooLarge(file)) continue;
-
-			const previewUrl = createTrackedObjectUrl(file);
-			newFiles.push(file);
-			newPreviewUrls.push(previewUrl);
-		}
-
-		if (newFiles.length > 0) {
-			workflow.addAdditionalImages(imageIndex, newFiles, newPreviewUrls);
-			log.info(`Pasted ${newFiles.length} image(s) as additional photos for image ${imageIndex}`);
-		}
+			if (newFiles.length > 0) {
+				workflow.addAdditionalImages(imageIndex, newFiles, newPreviewUrls);
+				log.info(`Pasted ${newFiles.length} image(s) as additional photos for image ${imageIndex}`);
+			}
+		})();
 	}
 
 	// ==========================================================================
@@ -342,7 +361,7 @@
 
 	function updateImageOption(
 		index: number,
-		field: 'separateItems' | 'extraInstructions' | 'assetId',
+		field: 'separateItems' | 'groupSimilar' | 'extraInstructions' | 'assetId',
 		value: boolean | string | null
 	) {
 		workflow.updateImageOptions(index, { [field]: value });
@@ -702,6 +721,38 @@
 								</div>
 								<span class="text-body-sm text-neutral-200">Separate into multiple items</span>
 							</label>
+
+							<!-- Group similar items toggle (only meaningful in multi-item mode) -->
+							{#if image.separateItems}
+								<label class="flex cursor-pointer items-center gap-3 pl-1">
+									<div class="relative">
+										<input
+											type="checkbox"
+											checked={image.groupSimilar ?? false}
+											onchange={(e) =>
+												updateImageOption(
+													index,
+													'groupSimilar',
+													(e.target as HTMLInputElement).checked
+												)}
+											class="peer sr-only"
+											disabled={isAnalyzing}
+										/>
+										<div
+											class="h-6 w-10 rounded-full bg-neutral-700 transition-colors peer-checked:bg-primary-600"
+										></div>
+										<div
+											class="absolute left-1 top-1 h-4 w-4 rounded-full bg-neutral-400 transition-all peer-checked:translate-x-4 peer-checked:bg-white"
+										></div>
+									</div>
+									<span class="flex items-center gap-0.5 text-body-sm text-neutral-200">
+										Group similar items
+										<InfoTooltip
+											text="Merge related items into grouped entries, e.g. 9 assorted ornaments become one 'Collection of Christmas Tree Ornaments' with quantity 9. Distinct items stay separate."
+										/>
+									</span>
+								</label>
+							{/if}
 
 							<!-- Asset ID section -->
 							{#if !image.separateItems}

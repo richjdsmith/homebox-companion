@@ -9,6 +9,7 @@ from homebox_companion.ai.prompts import (
     build_extended_fields_schema,
     build_item_schema,
     build_language_instruction,
+    build_location_schema,
     build_naming_examples,
     build_tag_prompt,
 )
@@ -309,3 +310,47 @@ class TestPromptStructureProperties:
         build_item_schema(empty_customizations)
         build_extended_fields_schema(empty_customizations)
         build_naming_examples(empty_customizations)
+
+
+class TestBuildLocationSchema:
+    """Test per-item image location schema generation."""
+
+    def test_multi_item_single_image(self) -> None:
+        """Multi-item mode with one image should include index 0 only."""
+        result = build_location_schema(multi_item=True, image_count=1)
+        assert "sourceImageIndex" in result
+        assert "bbox" in result
+        assert "(0)" in result
+        assert "0 to " not in result
+
+    def test_multi_item_multiple_images(self) -> None:
+        """Multi-item mode with several images should give index range."""
+        result = build_location_schema(multi_item=True, image_count=3)
+        assert "0 to 2" in result
+        assert "normalized to 0-1000" in result
+
+    def test_single_item_mode_omits_location(self) -> None:
+        """Single-item mode should not request location fields."""
+        result = build_location_schema(multi_item=False, image_count=2)
+        assert result == ""
+
+
+class TestGroupSimilarConstraints:
+    """Test grouping constraints in critical constraints."""
+
+    def test_group_similar_adds_grouping_rules(self) -> None:
+        """group_similar=True (multi-item) should add grouping rules."""
+        result = build_critical_constraints(single_item=False, group_similar=True)
+        assert "GROUPING RULES" in result
+        assert "Collection of" in result
+
+    def test_no_group_similar_keeps_default_rules(self) -> None:
+        """Default multi-item mode should not include grouping rules."""
+        result = build_critical_constraints(single_item=False, group_similar=False)
+        assert "GROUPING RULES" not in result
+
+    def test_single_item_ignores_group_similar(self) -> None:
+        """Single-item mode should never include grouping rules."""
+        result = build_critical_constraints(single_item=True, group_similar=True)
+        assert "GROUPING RULES" not in result
+        assert "ONE item" in result

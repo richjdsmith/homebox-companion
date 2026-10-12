@@ -17,6 +17,8 @@ export interface DetectOptions {
 	singleItem?: boolean;
 	extraInstructions?: string;
 	extractExtendedFields?: boolean;
+	/** Merge related items into "Collection of..." groups (multi-item mode) */
+	groupSimilar?: boolean;
 	additionalImages?: File[];
 	signal?: AbortSignal;
 }
@@ -79,6 +81,9 @@ export const vision = {
 		}
 		if (options.extractExtendedFields !== undefined) {
 			formData.append('extract_extended_fields', String(options.extractExtendedFields));
+		}
+		if (options.groupSimilar !== undefined) {
+			formData.append('group_similar', String(options.groupSimilar));
 		}
 		if (options.additionalImages) {
 			for (const img of options.additionalImages) {

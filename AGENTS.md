@@ -69,8 +69,8 @@ The app will be available at `http://localhost:8000`.
 
 ```bash
 HBC_LLM_API_KEY=sk-your-key             # Required
-HBC_LLM_MODEL=gpt-5-mini                # Optional (default)
-HBC_LLM_API_BASE=https://...            # Optional, for proxies
+HBC_LLM_MODEL=openrouter/openai/gpt-6-luna  # Optional (env bootstrap; settings.yaml profile wins)
+HBC_LLM_API_BASE=https://openrouter.ai/api/v1
 HBC_HOMEBOX_URL=https://demo.homebox.software
 ```
 
@@ -80,10 +80,11 @@ Demo credentials: `demo@example.com` / `demo`
 
 ## LLM Policy
 
-- Uses **LiteLLM** for multi-provider support
-- **Officially supported**: `gpt-5-mini`, `gpt-5-nano` only
-- Other models: `HBC_LLM_ALLOW_UNSAFE_MODELS=true` (unsupported)
-- Don't suggest alternative models in error messages
+- This is an **independently maintained fork** (richjdsmith/homebox-companion). No upstream tracking, no version sync, no upstream release checks (`HBC_DISABLE_UPDATE_CHECK=true` in production).
+- Uses **LiteLLM** with **OpenRouter** as the provider.
+- **Primary model**: `openrouter/openai/gpt-6-luna` (vision-capable, cheap/fast). Configured via the Settings UI → `settings.yaml` `llm_profiles` (env vars only bootstrap first boot).
+- Any OpenRouter vision model may be used. `HBC_LLM_ALLOW_UNSAFE_MODELS=true` bypasses LiteLLM's `supports_vision()` check, which is broken for `openrouter/*`-prefixed model ids.
+- Switching models: edit `llm_profiles[0].model` in `settings.yaml` **and** the compose env to keep them consistent.
 
 ---
 

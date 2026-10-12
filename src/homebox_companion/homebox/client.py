@@ -241,7 +241,7 @@ class HomeboxClient:
                 "This usually indicates a reverse proxy or server configuration issue."
             ) from json_err
 
-        token = data.get("token") or data.get("jwt") or data.get("accessToken")
+        token = data.get("token") or data.get("raw") or data.get("jwt") or data.get("accessToken")
         if not token:
             logger.error(f"Login: Response JSON missing token field. Keys present: {list(data.keys())}")
             raise HomeboxAuthError("Login response did not include a token field.")
@@ -286,14 +286,20 @@ class HomeboxClient:
 
         data = response.json()
 
+        # Homebox's login and refresh endpoints serialize the new token
+        # differently: login returns TokenResponse with the token under
+        # "token", while refresh (v0.26+) returns UserAuthTokenDetail with
+        # the token under "raw". Support both shapes.
+        new_token = data.get("token") or data.get("raw") or data.get("jwt") or data.get("accessToken")
+        if not new_token:
+            raise HomeboxAuthError("Token refresh response did not include a token field.")
+
         # Normalize token - Homebox v0.22.0+ returns with "Bearer " prefix
-        new_token = data.get("token", "")
-        if new_token:
-            original_token = new_token
-            new_token = _normalize_token(new_token)
-            if new_token != original_token:
-                logger.debug("Token refresh: Stripped 'Bearer ' prefix from token (Homebox v0.22+ format)")
-                data["token"] = new_token
+        original_token = new_token
+        new_token = _normalize_token(new_token)
+        if new_token != original_token:
+            logger.debug("Token refresh: Stripped 'Bearer ' prefix from token (Homebox v0.22+ format)")
+        data["token"] = new_token
 
         logger.debug("Token refresh: Successfully obtained new token")
         return data

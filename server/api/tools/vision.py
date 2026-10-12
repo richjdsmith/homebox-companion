@@ -12,6 +12,7 @@ from loguru import logger
 
 from homebox_companion import (
     analyze_item_details_from_images,
+    crop_image_bytes,
     detect_items_from_bytes,
     encode_compressed_image_to_base64,
     encode_image_bytes_to_data_uri,
@@ -112,6 +113,7 @@ async def detect_items(
     single_item: Annotated[bool, Form()] = False,
     extra_instructions: Annotated[str | None, Form()] = None,
     extract_extended_fields: Annotated[bool, Form()] = True,
+    group_similar: Annotated[bool, Form()] = False,
     additional_images: Annotated[
         list[UploadFile] | None, File(description="Additional images for the same item")
     ] = None,
@@ -125,12 +127,15 @@ async def detect_items(
         single_item: If True, treat everything as a single item.
         extra_instructions: Optional user hint about what's in the image.
         extract_extended_fields: If True, also extract extended fields.
+        group_similar: If True (multi-item mode), merge related items into
+            grouped "Collection of..." entries.
         additional_images: Optional additional images for the same item(s).
     """
     additional_count = len(additional_images) if additional_images else 0
     logger.info(f"Detecting items from image: {image.filename} (+ {additional_count} additional)")
     logger.info(f"Single item mode: {single_item}, Extra instructions: {extra_instructions}")
     logger.info(f"Extract extended fields: {extract_extended_fields}")
+    logger.info(f"Group similar: {group_similar}")
 
     # Read and validate primary image
     image_bytes = await validate_file_size(image)
@@ -183,12 +188,51 @@ async def detect_items(
         field_preferences=ctx.field_preferences,
         output_language=ctx.output_language,
         custom_fields=ctx.custom_fields,
+        group_similar=group_similar,
     )
     compression_task = compress_all_images()
 
     detected, compressed_images = await asyncio.gather(detection_task, compression_task)
 
     logger.info(f"Detected {len(detected)} items, compressed {len(compressed_images)} images")
+
+    # Build per-item cropped images in multi-item mode.
+    # Each detected item reports sourceImageIndex + bbox; we crop the
+    # relevant raw image and compress it for that item's thumbnail.
+    async def build_item_images() -> list[CompressedImage | None]:
+        """Build a per-item compressed image (cropped when possible)."""
+
+        async def build_one(idx: int) -> CompressedImage | None:
+            item = detected[idx]
+            # Select the raw image the LLM says best shows this item
+            source_images = [(image_bytes, content_type), *additional_image_data]
+            img_idx = item.source_image_index if item.source_image_index is not None else 0
+            if img_idx >= len(source_images):
+                img_idx = 0
+            raw_bytes, raw_mime = source_images[img_idx]
+
+            async with _get_compression_semaphore():
+                if not single_item and item.bbox:
+                    cropped = await asyncio.to_thread(crop_image_bytes, raw_bytes, item.bbox)
+                    base64_data, mime = await asyncio.to_thread(
+                        encode_compressed_image_to_base64, cropped, max_dimension, jpeg_quality
+                    )
+                elif not single_item:
+                    # No bbox reported - use the whole source image
+                    base64_data, mime = await asyncio.to_thread(
+                        encode_compressed_image_to_base64, raw_bytes, max_dimension, jpeg_quality
+                    )
+                else:
+                    return None
+            return CompressedImage(data=base64_data, mime_type=mime)
+
+        return await asyncio.gather(*[build_one(i) for i in range(len(detected))])
+
+    item_images: list[CompressedImage | None] = []
+    if not single_item and detected:
+        item_images = await build_item_images()
+        with_bbox = sum(1 for it in detected if it.bbox)
+        logger.debug(f"Built {len(item_images)} per-item images ({with_bbox} with bbox crops)")
 
     # Build response items first
     response_items = [
@@ -207,6 +251,11 @@ async def detect_items(
         )
         for item in detected
     ]
+
+    # Attach per-item images (index-aligned with detected items)
+    for idx, resp_item in enumerate(response_items):
+        if idx < len(item_images):
+            resp_item.compressed_image = item_images[idx]
 
     # ==========================================================================
     # DUPLICATE DETECTION: Check items with serial numbers for existing matches
@@ -261,10 +310,16 @@ async def analyze_item_advanced(
         logger.warning("No images provided for analysis")
         raise HTTPException(status_code=400, detail="At least one image is required")
 
-    # Validate and convert images to data URIs
+    # Validate and convert images to data URIs (sized for the vision model)
     validated_images = await validate_files_size(images)
     image_data_uris = [
-        encode_image_bytes_to_data_uri(img_bytes, mime_type) for img_bytes, mime_type in validated_images
+        encode_image_bytes_to_data_uri(
+            img_bytes,
+            mime_type,
+            max_dimension=settings.vision_max_dimension,
+            quality=settings.vision_quality,
+        )
+        for img_bytes, mime_type in validated_images
     ]
 
     # Analyze images
@@ -342,7 +397,12 @@ async def correct_item(
     # Read and validate image size
     image_bytes = await validate_file_size(image)
     content_type = image.content_type or "image/jpeg"
-    image_data_uri = encode_image_bytes_to_data_uri(image_bytes, content_type)
+    image_data_uri = encode_image_bytes_to_data_uri(
+        image_bytes,
+        content_type,
+        max_dimension=settings.vision_max_dimension,
+        quality=settings.vision_quality,
+    )
 
     logger.debug(f"Loaded {len(ctx.tags)} tags for context")
 

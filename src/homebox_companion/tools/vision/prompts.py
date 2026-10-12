@@ -10,6 +10,7 @@ from ...ai.prompts import (
     build_extended_fields_schema,
     build_item_schema,
     build_language_instruction,
+    build_location_schema,
     build_naming_examples,
     build_tag_prompt,
 )
@@ -25,6 +26,8 @@ def build_detection_system_prompt(
     field_preferences: dict[str, str] | None = None,
     output_language: str | None = None,
     custom_fields: list[CustomFieldDefinition] | None = None,
+    group_similar: bool = False,
+    image_count: int = 1,
 ) -> str:
     """Build the system prompt for item detection.
 
@@ -43,6 +46,9 @@ def build_detection_system_prompt(
         field_preferences: Optional dict of field customization instructions.
         output_language: Target language for output (default: English).
         custom_fields: Optional list of custom field definitions.
+        group_similar: If True (multi-item mode), merge related items into
+            grouped "Collection of..." entries.
+        image_count: Number of submitted images (for location schema).
 
     Returns:
         Complete system prompt string.
@@ -52,12 +58,13 @@ def build_detection_system_prompt(
 
     # Build components with customizations
     language_instr = build_language_instruction(output_language)
-    critical = build_critical_constraints(single_item)
+    critical = build_critical_constraints(single_item, group_similar)
     item_schema = build_item_schema(field_preferences)
     extended_schema = build_extended_fields_schema(field_preferences) if extract_extended_fields else ""
     custom_schema = build_custom_fields_schema(custom_fields or [])
     naming_examples = build_naming_examples(field_preferences)
     tag_prompt = build_tag_prompt(tags)
+    location_schema = build_location_schema(not single_item, image_count)
 
     return (
         # 1. Role + output format
@@ -69,6 +76,7 @@ def build_detection_system_prompt(
         f"{critical}\n\n"
         # 4. Schema
         f"{item_schema}"
+        f"{location_schema}"
         f"{extended_schema}"
         f"{custom_schema}\n\n"
         # 5. Naming examples
@@ -99,6 +107,10 @@ def build_detection_user_prompt(
     if extract_extended_fields:
         extended_example = ',"manufacturer":"DeWalt","modelNumber":"DCD771C2"'
 
+    location_example = ""
+    if not single_item:
+        location_example = ',"sourceImageIndex":0,"bbox":[80,120,520,760]'
+
     user_hint = ""
     if extra_instructions and extra_instructions.strip():
         user_hint = (
@@ -120,7 +132,7 @@ def build_detection_user_prompt(
         "List items that are the focus of this image. Return only JSON. "
         "Example: "
         '{"items":[{"name":"Claw Hammer","quantity":2,'
-        f'"description":"Steel claw hammer","tagIds":["id1"]{extended_example}'
+        f'"description":"Steel claw hammer","tagIds":["id1"]{extended_example}{location_example}'
         "}]}." + user_hint
     )
 
@@ -132,6 +144,8 @@ def build_multi_image_system_prompt(
     field_preferences: dict[str, str] | None = None,
     output_language: str | None = None,
     custom_fields: list[CustomFieldDefinition] | None = None,
+    group_similar: bool = False,
+    image_count: int = 1,
 ) -> str:
     """Build system prompt for multi-image detection.
 
@@ -142,6 +156,9 @@ def build_multi_image_system_prompt(
         field_preferences: Optional dict of field customization instructions.
         output_language: Target language for output (default: English).
         custom_fields: Optional list of custom field definitions.
+        group_similar: If True (multi-item mode), merge related items into
+            grouped "Collection of..." entries.
+        image_count: Number of submitted images (for location schema).
 
     Returns:
         Complete system prompt string.
@@ -151,12 +168,13 @@ def build_multi_image_system_prompt(
 
     # Build components with customizations
     language_instr = build_language_instruction(output_language)
-    critical = build_critical_constraints(single_item)
+    critical = build_critical_constraints(single_item, group_similar)
     item_schema = build_item_schema(field_preferences)
     extended_schema = build_extended_fields_schema(field_preferences) if extract_extended_fields else ""
     custom_schema = build_custom_fields_schema(custom_fields or [])
     naming_examples = build_naming_examples(field_preferences)
     tag_prompt = build_tag_prompt(tags)
+    location_schema = build_location_schema(not single_item, image_count)
 
     multi_note = (
         "Analyzing multiple images of the same item."
@@ -174,6 +192,7 @@ def build_multi_image_system_prompt(
         f"{critical}\n\n"
         # 4. Schema
         f"{item_schema}"
+        f"{location_schema}"
         f"{extended_schema}"
         f"{custom_schema}\n\n"
         # 5. Naming examples

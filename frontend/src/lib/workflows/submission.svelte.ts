@@ -23,6 +23,19 @@ import type {
 } from '$lib/types';
 
 // =============================================================================
+// CONSTANTS
+// =============================================================================
+
+/**
+ * Maximum concurrent item submissions. Items are created in parallel with
+ * a worker pool; 4 keeps Homebox responsive (it rate-limits at 30 req/s
+ * via the companion backend) while cutting wall-clock time ~4x for
+ * multi-item batches. Each item's additional-image uploads also run in
+ * parallel, so effective attachment concurrency is higher.
+ */
+const MAX_CONCURRENT_SUBMISSIONS = 4;
+
+// =============================================================================
 // TYPES
 // =============================================================================
 
@@ -90,13 +103,15 @@ export class SubmissionService {
 	/**
 	 * Upload attachments for a created item.
 	 * Returns status indicating what succeeded/failed.
+	 *
+	 * The primary image uploads first (its failure deletes the item), then
+	 * all additional images upload in parallel.
 	 */
 	private async uploadAttachments(
 		itemId: string,
 		confirmedItem: ConfirmedItem,
 		signal?: AbortSignal
 	): Promise<{ primaryFailed: boolean; additionalFailed: boolean }> {
-		let primaryFailed = false;
 		let additionalFailed = false;
 
 		// Upload custom thumbnail (replaces original) or compressed/original image as primary
@@ -115,7 +130,7 @@ export class SubmissionService {
 					throw error;
 				}
 				log.error(`Failed to upload thumbnail for ${confirmedItem.name}`, error);
-				primaryFailed = true;
+				return { primaryFailed: true, additionalFailed: false };
 			}
 		} else if (confirmedItem.compressedDataUrl) {
 			// Use compressed image if available (preferred)
@@ -133,7 +148,7 @@ export class SubmissionService {
 					throw error;
 				}
 				log.error(`Failed to upload compressed image for ${confirmedItem.name}`, error);
-				primaryFailed = true;
+				return { primaryFailed: true, additionalFailed: false };
 			}
 		} else if (confirmedItem.originalFile) {
 			// Fallback to original file if no compressed version available
@@ -150,14 +165,8 @@ export class SubmissionService {
 					throw error;
 				}
 				log.error(`Failed to upload image for ${confirmedItem.name}`, error);
-				primaryFailed = true;
+				return { primaryFailed: true, additionalFailed: false };
 			}
-		}
-
-		// If primary image failed, don't bother with additional images
-		// The item will be deleted anyway
-		if (primaryFailed) {
-			return { primaryFailed, additionalFailed: false };
 		}
 
 		// Upload additional images (prefer compressed versions)
@@ -168,40 +177,47 @@ export class SubmissionService {
 			confirmedItem.compressedAdditionalDataUrls &&
 			confirmedItem.compressedAdditionalDataUrls.length > 0
 		) {
-			for (let i = 0; i < confirmedItem.compressedAdditionalDataUrls.length; i++) {
-				try {
-					const additionalFile = await this.dataUrlToFile(
-						confirmedItem.compressedAdditionalDataUrls[i],
-						`${confirmedItem.name.replace(/\s+/g, '_')}_${i + 1}.jpg`
-					);
-					additionalToUpload.push(additionalFile);
-				} catch (error) {
-					log.error(`Failed to convert compressed additional image ${i}`, error);
+			const conversions = await Promise.allSettled(
+				confirmedItem.compressedAdditionalDataUrls.map((dataUrl, i) =>
+					this.dataUrlToFile(dataUrl, `${confirmedItem.name.replace(/\s+/g, '_')}_${i + 1}.jpg`)
+				)
+			);
+			conversions.forEach((conv) => {
+				if (conv.status === 'fulfilled') {
+					additionalToUpload.push(conv.value);
+				} else {
+					log.error(`Failed to convert compressed additional image`, conv.reason);
 					additionalFailed = true;
 				}
-			}
+			});
 		} else if (confirmedItem.additionalImages && confirmedItem.additionalImages.length > 0) {
 			// Fallback to original additional images
 			additionalToUpload.push(...confirmedItem.additionalImages);
 		}
 
-		// Upload all additional images
-		for (const addImage of additionalToUpload) {
-			try {
-				await withRetry(() => itemsApi.uploadAttachment(itemId, addImage, { signal }), {
-					maxAttempts: 3,
-					onRetry: (attempt) => log.debug(`Retrying additional image upload (attempt ${attempt})`),
-				});
-			} catch (error) {
-				if (error instanceof Error && error.name === 'AbortError') {
-					throw error;
+		// Upload all additional images in parallel
+		if (additionalToUpload.length > 0) {
+			const uploads = await Promise.allSettled(
+				additionalToUpload.map((addImage) =>
+					withRetry(() => itemsApi.uploadAttachment(itemId, addImage, { signal }), {
+						maxAttempts: 3,
+						onRetry: (attempt) =>
+							log.debug(`Retrying additional image upload (attempt ${attempt})`),
+					})
+				)
+			);
+			for (const upload of uploads) {
+				if (upload.status === 'rejected') {
+					if (upload.reason instanceof Error && upload.reason.name === 'AbortError') {
+						throw upload.reason;
+					}
+					log.error(`Failed to upload additional image for ${confirmedItem.name}`, upload.reason);
+					additionalFailed = true;
 				}
-				log.error(`Failed to upload additional image for ${confirmedItem.name}`, error);
-				additionalFailed = true;
 			}
 		}
 
-		return { primaryFailed, additionalFailed };
+		return { primaryFailed: false, additionalFailed };
 	}
 
 	/** Submit a single item. Updates itemStatuses. Returns status, optional error, and created ID. */
@@ -417,42 +433,59 @@ export class SubmissionService {
 		const signal = this.abortController?.signal;
 
 		try {
-			for (let i = 0; i < items.length; i++) {
-				if (signal?.aborted) {
-					return result;
-				}
+			// Submit items with a worker pool for throughput. Homebox handles
+			// concurrent creates fine, and each item's uploads are independent.
+			let nextIndex = 0;
+			let completedCount = 0;
 
-				const itemResult = await this.submitItem(i, items[i], locationId, parentId, signal);
+			const processNext = async (): Promise<void> => {
+				while (nextIndex < items.length) {
+					if (signal?.aborted) {
+						return;
+					}
+					const i = nextIndex++;
+					const itemResult = await this.submitItem(i, items[i], locationId, parentId, signal);
 
-				if (itemResult.status === 'success') {
-					result.successCount++;
-					if (itemResult.createdId) {
-						this.createdItemIds.set(i, itemResult.createdId);
-					}
-				} else if (itemResult.status === 'partial_success') {
-					result.partialSuccessCount++;
-					if (itemResult.createdId) {
-						this.createdItemIds.set(i, itemResult.createdId);
-					}
-					// Collect warning for partial success (e.g., missing attachments)
-					if (itemResult.error) {
-						result.errors.push(`${items[i].name}: ${itemResult.error}`);
-					}
-				} else {
-					result.failCount++;
-					// Collect error message for failed items
-					if (itemResult.error) {
-						result.errors.push(itemResult.error);
+					if (itemResult.status === 'success') {
+						result.successCount++;
+						if (itemResult.createdId) {
+							this.createdItemIds.set(i, itemResult.createdId);
+						}
+					} else if (itemResult.status === 'partial_success') {
+						result.partialSuccessCount++;
+						if (itemResult.createdId) {
+							this.createdItemIds.set(i, itemResult.createdId);
+						}
+						// Collect warning for partial success (e.g., missing attachments)
+						if (itemResult.error) {
+							result.errors.push(`${items[i].name}: ${itemResult.error}`);
+						}
 					} else {
-						result.errors.push(`Failed to create '${items[i].name}'`);
+						result.failCount++;
+						// Collect error message for failed items
+						if (itemResult.error) {
+							result.errors.push(itemResult.error);
+						} else {
+							result.errors.push(`Failed to create '${items[i].name}'`);
+						}
 					}
-				}
 
-				this.progress = {
-					current: i + 1,
-					total: items.length,
-					message: `Created ${result.successCount + result.partialSuccessCount} of ${items.length}...`,
-				};
+					completedCount++;
+					this.progress = {
+						current: completedCount,
+						total: items.length,
+						message: `Created ${result.successCount + result.partialSuccessCount} of ${items.length}...`,
+					};
+				}
+			};
+
+			// Cap workers to avoid overwhelming Homebox on large batches
+			const workerCount = Math.min(MAX_CONCURRENT_SUBMISSIONS, items.length);
+			await Promise.all(Array.from({ length: workerCount }, () => processNext()));
+
+			// Aborted mid-run: return what we have
+			if (signal?.aborted) {
+				return result;
 			}
 
 			// Determine overall success
@@ -529,29 +562,37 @@ export class SubmissionService {
 		const signal = this.abortController?.signal;
 
 		try {
-			for (const i of failedIndices) {
-				if (signal?.aborted) {
-					return result;
-				}
+			// Retry failed items in parallel (same worker pool as submitAll)
+			let nextRetry = 0;
 
-				const itemResult = await this.submitItem(i, items[i], locationId, parentId, signal);
-
-				if (itemResult.status === 'success') {
-					result.successCount++;
-				} else if (itemResult.status === 'partial_success') {
-					result.partialSuccessCount++;
-					if (itemResult.error) {
-						result.errors.push(`${items[i].name}: ${itemResult.error}`);
+			const processNextRetry = async (): Promise<void> => {
+				while (nextRetry < failedIndices.length) {
+					if (signal?.aborted) {
+						return;
 					}
-				} else {
-					result.failCount++;
-					if (itemResult.error) {
-						result.errors.push(itemResult.error);
+					const i = failedIndices[nextRetry++];
+					const itemResult = await this.submitItem(i, items[i], locationId, parentId, signal);
+
+					if (itemResult.status === 'success') {
+						result.successCount++;
+					} else if (itemResult.status === 'partial_success') {
+						result.partialSuccessCount++;
+						if (itemResult.error) {
+							result.errors.push(`${items[i].name}: ${itemResult.error}`);
+						}
 					} else {
-						result.errors.push(`Failed to create '${items[i].name}'`);
+						result.failCount++;
+						if (itemResult.error) {
+							result.errors.push(itemResult.error);
+						} else {
+							result.errors.push(`Failed to create '${items[i].name}'`);
+						}
 					}
 				}
-			}
+			};
+
+			const workerCount = Math.min(MAX_CONCURRENT_SUBMISSIONS, failedIndices.length);
+			await Promise.all(Array.from({ length: workerCount }, () => processNextRetry()));
 
 			// Check if all items are now successful
 			const allSuccess = Object.values(this.itemStatuses).every(

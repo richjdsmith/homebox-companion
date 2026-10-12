@@ -112,6 +112,13 @@ class Settings(BaseSettings):
     # Image processing configuration
     image_quality: ImageQuality = ImageQuality.MEDIUM
 
+    # Vision model input image size. Images sent to the LLM are resized to
+    # this max dimension and JPEG quality before base64 encoding. Vision
+    # models tile images at ~1024px internally, so sending larger images
+    # inflates tokens and upload time without improving detection.
+    vision_max_dimension: int = 1280
+    vision_quality: int = 80
+
     # LLM request timeout (in seconds)
     llm_timeout: int = 120
     # LLM streaming timeout (in seconds) - longer for large responses

@@ -174,6 +174,8 @@ def encode_image_bytes_to_data_uri(
     image_bytes: bytes,
     mime_type: str = "image/jpeg",
     optimize: bool = True,
+    max_dimension: int | None = None,
+    quality: int | None = None,
 ) -> str:
     """Encode raw image bytes to a data URI for vision model APIs.
 
@@ -181,12 +183,18 @@ def encode_image_bytes_to_data_uri(
         image_bytes: Raw image data.
         mime_type: MIME type of the image.
         optimize: Whether to optimize the image for vision processing.
+        max_dimension: Optional max dimension override for optimization.
+        quality: Optional JPEG quality override for optimization.
 
     Returns:
         A data URI string.
     """
     if optimize:
-        image_bytes, mime_type = optimize_image_for_vision(image_bytes)
+        image_bytes, mime_type = optimize_image_for_vision(
+            image_bytes,
+            max_dimension=max_dimension or DEFAULT_MAX_DIMENSION,
+            quality=quality if quality is not None else DEFAULT_JPEG_QUALITY,
+        )
 
     # Extract suffix from mime_type (e.g., "image/jpeg" -> "jpeg")
     suffix = mime_type.split("/")[-1] if "/" in mime_type else "jpeg"
@@ -252,6 +260,73 @@ def compress_image_for_upload(
         logger.warning(f"Image compression failed, using original: {e}")
         # Return original bytes with their actual MIME type, not hardcoded JPEG
         return image_bytes, _detect_mime_type(image_bytes)
+
+
+def crop_image_bytes(
+    image_bytes: bytes,
+    bbox: list[float],
+    padding_ratio: float = 0.08,
+) -> bytes:
+    """Crop an image to a normalized bounding box.
+
+    The bbox is expressed as [x1, y1, x2, y2] with each value normalized
+    to 0-1000 relative to the image dimensions (0 = top/left, 1000 =
+    bottom/right). This is resolution-independent so the LLM can report
+    boxes without knowing pixel dimensions.
+
+    A small padding ratio is added around the box so the crop keeps a
+    little context, and the box is clamped to the image bounds.
+
+    Args:
+        image_bytes: Raw image data.
+        bbox: Normalized bounding box [x1, y1, x2, y2], values 0-1000.
+        padding_ratio: Fraction of the box size to add as padding (default 8%).
+
+    Returns:
+        Cropped image bytes (original format). On any failure, returns
+        the original bytes unchanged so callers can fall back gracefully.
+    """
+    if len(bbox) != 4:
+        logger.warning(f"Invalid bbox length {len(bbox)}, returning original image")
+        return image_bytes
+
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        img = _normalize_image(img)
+        width, height = img.size
+
+        # Denormalize 0-1000 coordinates to pixels
+        x1 = max(0.0, min(bbox[0], bbox[2])) / 1000 * width
+        y1 = max(0.0, min(bbox[1], bbox[3])) / 1000 * height
+        x2 = min(1000.0, max(bbox[0], bbox[2])) / 1000 * width
+        y2 = min(1000.0, max(bbox[1], bbox[3])) / 1000 * height
+
+        # Add padding
+        pad_x = (x2 - x1) * padding_ratio
+        pad_y = (y2 - y1) * padding_ratio
+        x1, y1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
+        x2, y2 = min(width, x2 + pad_x), min(height, y2 + pad_y)
+
+        # Ensure a sane minimum size (avoid degenerate 1px crops)
+        if x2 - x1 < 8 or y2 - y1 < 8:
+            logger.warning(f"Degenerate crop box {(x1, y1, x2, y2)}, returning original image")
+            return image_bytes
+
+        cropped = img.crop((int(x1), int(y1), int(x2), int(y2)))
+
+        output = io.BytesIO()
+        img_format = img.format or "JPEG"
+        if img_format.upper() not in _FORMAT_TO_MIME:
+            img_format = "JPEG"
+        if img_format.upper() == "JPEG":
+            cropped.save(output, format="JPEG", quality=90)
+        else:
+            cropped.save(output, format=img_format)
+        return output.getvalue()
+
+    except Exception as e:
+        logger.warning(f"Image crop failed, using original: {e}")
+        return image_bytes
 
 
 def encode_compressed_image_to_base64(

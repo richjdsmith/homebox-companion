@@ -44,6 +44,13 @@ class DetectedItem(BaseModel):
     purchase_from: Annotated[str, Field(max_length=255)] | None = Field(default=None, alias="purchaseFrom")
     notes: Annotated[str, Field(max_length=1000)] | None = None
 
+    # Per-item image location (multi-item mode only).
+    # Index into the submitted image list (0 = primary image) of the photo
+    # that best shows this item, plus a normalized bounding box
+    # [x1, y1, x2, y2] on that image, each value 0-1000.
+    source_image_index: int | None = Field(default=None, ge=0, alias="sourceImageIndex")
+    bbox: list[float] | None = Field(default=None, min_length=4, max_length=4)
+
     def get_extended_fields_payload(self) -> dict[str, str | float] | None:
         """Get extended fields that require an update after item creation.
 

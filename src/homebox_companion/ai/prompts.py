@@ -39,7 +39,7 @@ def build_custom_fields_schema(custom_fields: list[CustomFieldDefinition]) -> st
     return "\n".join(lines)
 
 
-def build_critical_constraints(single_item: bool = False) -> str:
+def build_critical_constraints(single_item: bool = False, group_similar: bool = False) -> str:
     """Build critical constraints that MUST appear early in prompt.
 
     These are the most important rules that should be front-loaded
@@ -47,6 +47,8 @@ def build_critical_constraints(single_item: bool = False) -> str:
 
     Args:
         single_item: If True, enforce single-item grouping mode.
+        group_similar: If True (multi-item mode only), merge related/
+            homogeneous items into grouped "Collection of..." entries.
 
     Returns:
         Critical constraints string.
@@ -57,13 +59,56 @@ def build_critical_constraints(single_item: bool = False) -> str:
             "Do NOT separate into multiple entries. Count how many are visible.\n"
             "Do NOT guess or infer - only use what's visible or user-stated."
         )
-    return (
+    constraints = (
         "RULES:\n"
         "- Combine identical objects into one entry with correct quantity\n"
         "- Separate distinctly different items into separate entries\n"
         "- Do NOT guess or infer - only use what's visible or user-stated\n"
         "- Ignore background elements (floors, walls, shelves, packaging)"
     )
+    if group_similar:
+        constraints += (
+            "\n\nGROUPING RULES (takes priority over the rules above):\n"
+            "- Merge items that belong to a logical group into ONE entry, "
+            "even if they are not identical. Example: 9 assorted Christmas tree "
+            "ornaments -> one entry named \"Collection of Christmas Tree Ornaments\" "
+            "with quantity 9, NOT 9 separate entries.\n"
+            "- Name grouped entries \"Collection of <plural noun>\" "
+            "(e.g. \"Collection of Christmas Tree Decorations\").\n"
+            "- Keep genuinely different categories as their own entries "
+            "(e.g. \"String Lights\" and \"Garland\" stay separate from "
+            "\"Collection of Christmas Tree Ornaments\").\n"
+            "- Merge only when items share an obvious category/purpose; "
+            "do NOT merge unrelated items."
+        )
+    return constraints
+
+
+def build_location_schema(multi_item: bool, image_count: int) -> str:
+    """Build the per-item image location schema section.
+
+    In multi-item mode, each detected item reports which submitted image
+    best shows it and a normalized bounding box so the caller can crop a
+    per-item thumbnail.
+
+    Args:
+        multi_item: True when detection is in multi-item mode.
+        image_count: Number of images submitted (>= 1).
+
+    Returns:
+        Location schema string, or empty string when not applicable.
+    """
+    if not multi_item or image_count < 1:
+        return ""
+    range_hint = f"0 to {image_count - 1}" if image_count > 1 else "0"
+    return f"""
+IMAGE LOCATION FIELDS (required for every item):
+- sourceImageIndex: integer ({range_hint}) - index of the submitted image
+  that best shows this item (0 = the first/primary image)
+- bbox: array of 4 numbers [x1, y1, x2, y2] - bounding box of this item on that image,
+  normalized to 0-1000 (0 = top/left edge, 1000 = bottom/right edge). For grouped
+  entries, the box covering the whole group. Draw the box tightly around the item(s)
+  with a little breathing room."""
 
 
 def build_naming_examples(customizations: dict[str, str]) -> str:

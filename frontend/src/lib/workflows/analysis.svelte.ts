@@ -154,6 +154,7 @@ export class AnalysisService {
 						singleItem: !image.separateItems,
 						extraInstructions: image.extraInstructions || undefined,
 						extractExtendedFields: true,
+						groupSimilar: image.groupSimilar && image.separateItems,
 						additionalImages: image.additionalFiles,
 						signal,
 					});
@@ -234,12 +235,8 @@ export class AnalysisService {
 		// Process results
 		for (const result of results) {
 			if (result.success) {
-				// Get compressed images for this result
+				// Get compressed images for this result (shared fallbacks)
 				const compressedImages = result.compressedImages || [];
-
-				// First compressed image is the primary, rest are additional
-				const primaryCompressed = compressedImages[0];
-				const additionalCompressed = compressedImages.slice(1);
 
 				for (const item of result.items) {
 					// Add default tag if configured and valid
@@ -248,17 +245,34 @@ export class AnalysisService {
 						tagIds = [...tagIds, validDefaultTagId];
 					}
 
+					// Per-item image (multi-item mode): the backend crops the
+					// region of the photo that shows this specific item.
+					// Falls back to the shared images when absent.
+					const perItemImage = item.compressed_image;
+					const isMultiItem = result.image.separateItems && result.items.length > 1;
+
+					const primaryCompressed = perItemImage ?? compressedImages[0];
+					const additionalCompressed = perItemImage
+						? [] // per-item image already shows the right thing
+						: compressedImages.slice(1);
+					// In multi-item mode without a per-item crop, don't attach
+					// unrelated angle shots to every split item.
+					const additionalForItem = isMultiItem && !perItemImage ? [] : additionalCompressed;
+
 					// Convert compressed images to data URLs
 					const compressedDataUrl = primaryCompressed
 						? `data:${primaryCompressed.mime_type};base64,${primaryCompressed.data}`
 						: undefined;
 
-					const compressedAdditionalDataUrls = additionalCompressed.map(
+					const compressedAdditionalDataUrls = additionalForItem.map(
 						(img) => `data:${img.mime_type};base64,${img.data}`
 					);
 
+					// Strip backend-only field before building the review item
+					const { compressed_image: _perItem, ...itemCore } = item;
+
 					allDetectedItems.push({
-						...item,
+						...itemCore,
 						tag_ids: tagIds,
 						sourceImageIndex: result.imageIndex,
 						originalFile: result.image.file,
